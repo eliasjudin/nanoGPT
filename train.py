@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import json
 
 import numpy as np
 import torch
@@ -30,6 +31,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
 from layers.stiefel_linear import StiefelLinear
 from layers.lora_stiefel import LoRALinear
+from manifold.metrics import stiefel_orthogonality_residual
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -56,6 +58,22 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# Stiefel/LoRA knobs (optional)
+use_stiefel_attn = False
+stiefel_q = True
+stiefel_k = True
+stiefel_o = False
+stiefel_mode = 'columns'
+stiefel_spectral_budget = 0.0
+stiefel_budget_power_iters = 2
+stiefel_budget_margin = 0.05
+log_stiefel_spectral_stats = False
+lora_rank = 0
+lora_alpha = 0.0
+lora_dropout = 0.0
+stiefel_lora_B = False
+# Logging knobs
+log_specnorm = False
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -105,6 +123,9 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    metrics_path = os.path.join(out_dir, 'metrics.jsonl')
+else:
+    metrics_path = None
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -146,8 +167,20 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+    bias=bias, vocab_size=None, dropout=dropout,
+    # new knobs
+    use_stiefel_attn=use_stiefel_attn,
+    stiefel_q=stiefel_q, stiefel_k=stiefel_k, stiefel_o=stiefel_o,
+    stiefel_mode=stiefel_mode,
+    lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+    stiefel_lora_B=stiefel_lora_B,
+    stiefel_spectral_budget=stiefel_spectral_budget,
+    stiefel_budget_power_iters=stiefel_budget_power_iters,
+    stiefel_budget_margin=stiefel_budget_margin,
+    log_stiefel_spectral_stats=log_stiefel_spectral_stats,
+) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -260,6 +293,47 @@ def stiefel_reproject_all_(module: torch.nn.Module):
         elif isinstance(m, LoRALinear) and getattr(m, 'stiefel_B', False):
             m.reproject_()
 
+
+@torch.no_grad()
+def collect_stiefel_stats(module: torch.nn.Module, mode: str = 'columns'):
+    """Aggregate scalar diagnostics for Stiefel-aware modules."""
+
+    ortho_vals = []
+    attn_vars = []
+    spectral_vals = []
+    spectral_clips = []
+
+    for submodule in module.modules():
+        if isinstance(submodule, StiefelLinear):
+            ortho_vals.append(
+                stiefel_orthogonality_residual(
+                    submodule.weight,
+                    mode=getattr(submodule, 'stiefel_mode', mode),
+                )
+            )
+            metrics = getattr(submodule, 'manifold_metrics', None)
+            if isinstance(metrics, dict) and metrics:
+                spec = metrics.get('spectral_norm')
+                if spec is not None and math.isfinite(spec):
+                    spectral_vals.append(float(spec))
+                clipped = metrics.get('spectral_clipped')
+                if clipped is not None and math.isfinite(clipped):
+                    spectral_clips.append(float(clipped))
+        if submodule.__class__.__name__ == 'CausalSelfAttentionStiefel':
+            v = getattr(submodule, 'last_attn_var', None)
+            if v is not None and math.isfinite(v):
+                attn_vars.append(float(v))
+
+    stats = {
+        'ortho_res_mean': float(np.mean(ortho_vals)) if ortho_vals else None,
+        'ortho_res_max': float(np.max(ortho_vals)) if ortho_vals else None,
+        'attn_var_mean': float(np.mean(attn_vars)) if attn_vars else None,
+        'spectral_norm_mean': float(np.mean(spectral_vals)) if spectral_vals else None,
+        'spectral_norm_max': float(np.max(spectral_vals)) if spectral_vals else None,
+        'spectral_clip_rate': float(np.mean(spectral_clips)) if spectral_clips else None,
+    }
+    return stats
+
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -305,12 +379,20 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+# enable optional attention stats logging when available
+raw_model = model.module if ddp else model
+for m in raw_model.modules():
+    if hasattr(m, 'log_stats'):
+        m.log_stats = True
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+last_grad_norm = None
+last_grad_clipped = False
 while True:
 
     # determine and set the learning rate for this iteration
@@ -330,6 +412,17 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+        # persist eval metrics
+        if metrics_path is not None:
+            with open(metrics_path, 'a') as f:
+                f.write(json.dumps({
+                    'event': 'eval',
+                    'iter': int(iter_num),
+                    'train_loss': float(losses['train']),
+                    'val_loss': float(losses['val']),
+                    'lr': float(lr),
+                    'mfu_pct': float(running_mfu*100.0),
+                }) + "\n")
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -367,8 +460,15 @@ while True:
         scaler.unscale_(optimizer)
     # Project grads to Stiefel tangent spaces before clipping (Riemannian update)
     stiefel_project_grads_(raw_model)
+    last_grad_norm = None
+    last_grad_clipped = False
     if grad_clip != 0.0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        try:
+            last_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip).item()
+            last_grad_clipped = last_grad_norm > grad_clip
+        except Exception:
+            last_grad_norm = None
+            last_grad_clipped = False
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
@@ -388,7 +488,68 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        msg = f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+        stiefel_stats = None
+        if use_stiefel_attn:
+            stiefel_stats = collect_stiefel_stats(raw_model)
+            if stiefel_stats['ortho_res_mean'] is not None:
+                msg += f", ortho_res(mean) {stiefel_stats['ortho_res_mean']:.3e}"
+            if stiefel_stats['attn_var_mean'] is not None:
+                msg += f", attn_var(mean) {stiefel_stats['attn_var_mean']:.3e}"
+            if log_stiefel_spectral_stats:
+                if stiefel_stats['spectral_norm_mean'] is not None:
+                    msg += f", spec_norm(mean) {stiefel_stats['spectral_norm_mean']:.3f}"
+                if stiefel_stats['spectral_clip_rate'] is not None:
+                    msg += f", spec_clip(rate) {stiefel_stats['spectral_clip_rate']:.2f}"
+            if wandb_log:
+                import wandb
+
+                payload = {
+                    "iter": iter_num,
+                    "diag/ortho_res_mean": stiefel_stats['ortho_res_mean'],
+                    "diag/ortho_res_max": stiefel_stats['ortho_res_max'],
+                    "diag/attn_var_mean": stiefel_stats['attn_var_mean'],
+                }
+                if log_stiefel_spectral_stats:
+                    payload.update(
+                        {
+                            "diag/spectral_norm_mean": stiefel_stats['spectral_norm_mean'],
+                            "diag/spectral_norm_max": stiefel_stats['spectral_norm_max'],
+                            "diag/spectral_clip_rate": stiefel_stats['spectral_clip_rate'],
+                        }
+                    )
+                wandb.log(payload)
+
+        print(msg)
+        if metrics_path is not None:
+            rec = {
+                'event': 'train_iter',
+                'iter': int(iter_num),
+                'loss': float(lossf),
+                'dt_ms': float(dt*1000.0),
+                'mfu_pct': float(running_mfu*100.0),
+                'grad_norm': float(last_grad_norm) if last_grad_norm is not None else None,
+                'grad_clipped': bool(last_grad_clipped),
+                'lr': float(lr),
+            }
+            if stiefel_stats is not None:
+                rec.update(
+                    {
+                        'ortho_res_mean': stiefel_stats['ortho_res_mean'],
+                        'ortho_res_max': stiefel_stats['ortho_res_max'],
+                        'attn_var_mean': stiefel_stats['attn_var_mean'],
+                    }
+                )
+                if log_stiefel_spectral_stats:
+                    rec.update(
+                        {
+                            'spectral_norm_mean': stiefel_stats['spectral_norm_mean'],
+                            'spectral_norm_max': stiefel_stats['spectral_norm_max'],
+                            'spectral_clip_rate': stiefel_stats['spectral_clip_rate'],
+                        }
+                    )
+            with open(metrics_path, 'a') as f:
+                f.write(json.dumps(rec) + "\n")
     iter_num += 1
     local_iter_num += 1
 

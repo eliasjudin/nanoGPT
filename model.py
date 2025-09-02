@@ -14,6 +14,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from layers.stiefel_linear import StiefelLinear
+from layers.lora_stiefel import LoRALinear
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -31,6 +33,8 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        self.log_stats = False
+        self.last_attn_logit_var = None
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
@@ -59,14 +63,26 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        # If stats are requested, take manual path to access logits
+        if self.flash and not self.log_stats:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
+            att_logits = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            if not self.flash:
+                att_logits = att_logits.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            else:
+                causal = torch.ones((T, T), device=att_logits.device, dtype=torch.bool).tril()
+                att_logits = att_logits.masked_fill(~causal.view(1,1,T,T), float('-inf'))
+            if self.log_stats:
+                with torch.no_grad():
+                    finite = torch.isfinite(att_logits)
+                    if finite.any():
+                        self.last_attn_logit_var = att_logits[finite].var().detach().cpu()
+                    else:
+                        self.last_attn_logit_var = None
+            att = F.softmax(att_logits, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -96,7 +112,10 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        if getattr(config, "use_stiefel_attn", False) or getattr(config, "lora_rank", 0) > 0:
+            self.attn = CausalSelfAttentionStiefel(config)
+        else:
+            self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -114,6 +133,98 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
+    # NEW: manifold/LoRA knobs
+    use_stiefel_attn: bool = False
+    stiefel_q: bool = True
+    stiefel_k: bool = True
+    stiefel_o: bool = False
+    stiefel_mode: str = "columns"
+    lora_rank: int = 0
+    lora_alpha: float = 0.0
+    lora_dropout: float = 0.0
+    stiefel_lora_B: bool = False
+
+class CausalSelfAttentionStiefel(nn.Module):
+    """
+    Drop-in replacement that splits c_attn into {Wq, Wk, Wv}, allowing
+    Stiefel-constrained Q/K (and optional O) and/or LoRA on any of them.
+    """
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        hs = config.n_embd
+        self.log_stats = False  # enable in training to record attention stats
+        self.last_attn_logit_var = None
+
+        # factories
+        def mk_lin(stiefel: bool, lora: bool):
+            if lora and config.lora_rank > 0:
+                return LoRALinear(
+                    in_features=hs, out_features=hs, bias=config.bias,
+                    lora_rank=config.lora_rank, lora_alpha=config.lora_alpha,
+                    lora_dropout=config.lora_dropout,
+                    stiefel_B=config.stiefel_lora_B, stiefel_mode=config.stiefel_mode)
+            if stiefel:
+                return StiefelLinear(hs, hs, bias=config.bias, stiefel_mode=config.stiefel_mode)
+            return nn.Linear(hs, hs, bias=config.bias)
+
+        # Q, K can be Stiefel; V typically Euclidean/LoRA
+        self.Wq = mk_lin(getattr(config, 'stiefel_q', True), lora=False)
+        self.Wk = mk_lin(getattr(config, 'stiefel_k', True), lora=False)
+        self.Wv = mk_lin(False, lora=(getattr(config, 'lora_rank', 0) > 0))
+        self.Wo = mk_lin(getattr(config, 'stiefel_o', False), lora=(getattr(config, 'lora_rank', 0) > 0))
+
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias",
+                torch.tril(torch.ones(config.block_size, config.block_size))
+                .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x):
+        B, T, C = x.size()
+        q = self.Wq(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        k = self.Wk(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = self.Wv(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        # If stats requested, take the manual path to access logits
+        if self.flash and not self.log_stats:
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None,
+                dropout_p=self.dropout if self.training else 0, is_causal=True
+            )
+        else:
+            att_logits = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            if not self.flash:
+                # has buffer bias for causal mask
+                att_logits = att_logits.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+            else:
+                # create a quick causal mask when flash is available but we're not using it
+                causal = torch.ones((T, T), device=att_logits.device, dtype=torch.bool).tril()
+                att_logits = att_logits.masked_fill(~causal.view(1,1,T,T), float('-inf'))
+            if self.log_stats:
+                with torch.no_grad():
+                    # finite values only to avoid -inf contributing to var
+                    finite = torch.isfinite(att_logits)
+                    if finite.any():
+                        self.last_attn_logit_var = att_logits[finite].var().detach().cpu()
+                    else:
+                        self.last_attn_logit_var = None
+            att = F.softmax(att_logits, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.Wo(y)
+        y = self.resid_dropout(y)
+        return y
 
 class GPT(nn.Module):
 

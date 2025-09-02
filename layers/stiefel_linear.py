@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from manifold.stiefel import stiefel_reorth_
 
 
@@ -20,18 +21,21 @@ class StiefelLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """
+        Orthogonal initialization followed by a projection to enforce the
+        selected Stiefel mode (e.g., rows vs columns). This guarantees the
+        constraint holds at initialization regardless of shape.
+        """
         nn.init.orthogonal_(self.weight)
         if self.bias is not None:
             nn.init.zeros_(self.bias)
+        # Ensure the requested Stiefel constraint is satisfied at init
+        self.reproject_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = x @ self.weight.t()
-        if self.bias is not None:
-            y = y + self.bias
-        return y
+        return F.linear(x, self.weight, self.bias)
 
     @torch.no_grad()
     def reproject_(self):
         stiefel_reorth_(self.weight, mode=self.stiefel_mode)
         return self
-

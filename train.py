@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import json
 
 import numpy as np
 import torch
@@ -54,6 +55,18 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+# Stiefel/LoRA knobs (optional)
+use_stiefel_attn = False
+stiefel_q = True
+stiefel_k = True
+stiefel_o = False
+stiefel_mode = 'columns'
+lora_rank = 0
+lora_alpha = 0.0
+lora_dropout = 0.0
+stiefel_lora_B = False
+# Logging knobs
+log_specnorm = False
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -103,6 +116,9 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    metrics_path = os.path.join(out_dir, 'metrics.jsonl')
+else:
+    metrics_path = None
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -144,8 +160,16 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+    bias=bias, vocab_size=None, dropout=dropout,
+    # new knobs
+    use_stiefel_attn=use_stiefel_attn,
+    stiefel_q=stiefel_q, stiefel_k=stiefel_k, stiefel_o=stiefel_o,
+    stiefel_mode=stiefel_mode,
+    lora_rank=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
+    stiefel_lora_B=stiefel_lora_B,
+) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -246,12 +270,20 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+# enable optional attention stats logging when available
+raw_model = model.module if ddp else model
+for m in raw_model.modules():
+    if hasattr(m, 'log_stats'):
+        m.log_stats = True
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+last_grad_norm = None
+last_grad_clipped = False
 while True:
 
     # determine and set the learning rate for this iteration
@@ -271,6 +303,17 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+        # persist eval metrics
+        if metrics_path is not None:
+            with open(metrics_path, 'a') as f:
+                f.write(json.dumps({
+                    'event': 'eval',
+                    'iter': int(iter_num),
+                    'train_loss': float(losses['train']),
+                    'val_loss': float(losses['val']),
+                    'lr': float(lr),
+                    'mfu_pct': float(running_mfu*100.0),
+                }) + "\n")
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -306,12 +349,25 @@ while True:
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        try:
+            last_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip).item()
+            last_grad_clipped = last_grad_norm > grad_clip
+        except Exception:
+            last_grad_norm = None
+            last_grad_clipped = False
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+
+    # NEW: reproject any Stiefel/LoRA-Stiefel layers to maintain constraints
+    with torch.no_grad():
+        target_model = raw_model  # unwrap DDP/compile wrappers
+        for m in target_model.modules():
+            reproject = getattr(m, "reproject_", None)
+            if callable(reproject):
+                reproject()
 
     # timing and logging
     t1 = time.time()
@@ -324,7 +380,87 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        # compute orthogonality residuals for any StiefelLinear
+        try:
+            import torch
+            from layers.stiefel_linear import StiefelLinear
+            ortho_res = []
+            with torch.no_grad():
+                for m in raw_model.modules():
+                    if isinstance(m, StiefelLinear):
+                        W = m.weight
+                        m_out, n_in = W.shape
+                        mode_eff = m.stiefel_mode
+                        if mode_eff == 'columns' and m_out < n_in:
+                            mode_eff = 'rows'
+                        if mode_eff == 'columns':
+                            G = W.t() @ W
+                            I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
+                            r = (G - I).norm(p='fro').item()
+                        else:
+                            G = W @ W.t()
+                            I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
+                            r = (G - I).norm(p='fro').item()
+                        ortho_res.append(r)
+            ortho_txt = f"ortho_res(mean)={sum(ortho_res)/len(ortho_res):.3e}" if ortho_res else "ortho_res(n/a)"
+        except Exception:
+            ortho_txt = "ortho_res(err)"
+
+        # collect attention logit variance across layers if available
+        try:
+            attn_vars = []
+            for m in raw_model.modules():
+                v = getattr(m, 'last_attn_logit_var', None)
+                if v is not None:
+                    attn_vars.append(float(v))
+            attn_txt = f"attn_var(mean)={(sum(attn_vars)/len(attn_vars)):.3e}" if attn_vars else "attn_var(n/a)"
+        except Exception:
+            attn_txt = "attn_var(err)"
+
+        # spectral norms for Q/K (baseline c_attn and stiefel split)
+        spec_qs, spec_ks = [], []
+        if log_specnorm:
+            try:
+                import torch
+                import torch.nn as nn
+                with torch.no_grad():
+                    for m in raw_model.modules():
+                        # baseline block
+                        if hasattr(m, 'c_attn') and isinstance(getattr(m, 'c_attn'), nn.Linear) and hasattr(m, 'n_embd'):
+                            hs = int(m.n_embd)
+                            W = m.c_attn.weight
+                            Wq = W[:hs, :]
+                            Wk = W[hs:2*hs, :]
+                            spec_qs.append(torch.linalg.matrix_norm(Wq.float(), 2).item())
+                            spec_ks.append(torch.linalg.matrix_norm(Wk.float(), 2).item())
+                        # stiefel split block
+                        if hasattr(m, 'Wq') and hasattr(m, 'Wk'):
+                            Wq = m.Wq.weight
+                            Wk = m.Wk.weight
+                            spec_qs.append(torch.linalg.matrix_norm(Wq.float(), 2).item())
+                            spec_ks.append(torch.linalg.matrix_norm(Wk.float(), 2).item())
+            except Exception:
+                pass
+
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, {ortho_txt}, {attn_txt}")
+        # write metrics jsonl
+        if metrics_path is not None:
+            rec = {
+                'event': 'train_iter',
+                'iter': int(iter_num),
+                'loss': float(lossf),
+                'dt_ms': float(dt*1000.0),
+                'mfu_pct': float(running_mfu*100.0),
+                'ortho_res_mean': None if 'n/a' in ortho_txt or 'err' in ortho_txt else float(sum(ortho_res)/len(ortho_res)),
+                'attn_var_mean': None if 'n/a' in attn_txt or 'err' in attn_txt else float(sum(attn_vars)/len(attn_vars)),
+                'grad_norm': float(last_grad_norm) if last_grad_norm is not None else None,
+                'grad_clipped': bool(last_grad_clipped),
+                'lr': float(lr),
+                'spec_q_mean': float(sum(spec_qs)/len(spec_qs)) if spec_qs else None,
+                'spec_k_mean': float(sum(spec_ks)/len(spec_ks)) if spec_ks else None,
+            }
+            with open(metrics_path, 'a') as f:
+                f.write(json.dumps(rec) + "\n")
     iter_num += 1
     local_iter_num += 1
 

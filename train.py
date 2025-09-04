@@ -28,6 +28,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from layers.stiefel_linear import StiefelLinear
+from layers.lora_stiefel import LoRALinear
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -201,6 +203,63 @@ if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
+# --- Stiefel/LoRA: Riemannian gradient projection and retraction helpers ---
+@torch.no_grad()
+def _sym_(M: torch.Tensor) -> torch.Tensor:
+    # in-place symmetric part; returns the view for chaining
+    M.add_(M.t()).mul_(0.5)
+    return M
+
+@torch.no_grad()
+def stiefel_project_grads_(module: torch.nn.Module):
+    """Project Euclidean grads onto Stiefel tangent spaces for relevant params.
+    For StiefelLinear.weight (W ∈ R^{out×in}):
+      columns-mode: g_R = g - W sym(W^T g)
+      rows-mode:    g_R = g - sym(g W^T) W
+    For LoRALinear with stiefel_B: apply same projection to B.
+    """
+    for m in module.modules():
+        if isinstance(m, StiefelLinear):
+            W = m.weight
+            g = W.grad
+            if g is None:
+                continue
+            mode = getattr(m, 'stiefel_mode', 'columns')
+            if mode == 'columns':
+                # g <- g - W sym(W^T g)
+                # tmp = W^T g  (in×in), sym in-place, then W @ tmp
+                tmp = W.t().mm(g)
+                _sym_(tmp)
+                g.sub_(W.mm(tmp))
+            else:
+                # rows mode: g <- g - sym(g W^T) W
+                tmp = g.mm(W.t())
+                _sym_(tmp)
+                g.sub_(tmp.mm(W))
+        elif isinstance(m, LoRALinear) and getattr(m, 'stiefel_B', False):
+            B = m.B
+            if B is None or B.grad is None:
+                continue
+            g = B.grad
+            mode = getattr(m, 'stiefel_mode', 'columns')
+            if mode == 'columns':
+                tmp = B.t().mm(g)
+                _sym_(tmp)
+                g.sub_(B.mm(tmp))
+            else:
+                tmp = g.mm(B.t())
+                _sym_(tmp)
+                g.sub_(tmp.mm(B))
+
+@torch.no_grad()
+def stiefel_reproject_all_(module: torch.nn.Module):
+    """Retract Stiefel/LoRA-B params back to manifold after optimizer step."""
+    for m in module.modules():
+        if isinstance(m, StiefelLinear):
+            m.reproject_()
+        elif isinstance(m, LoRALinear) and getattr(m, 'stiefel_B', False):
+            m.reproject_()
+
 # compile the model
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -303,13 +362,18 @@ while True:
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
-    # clip the gradient
+    # Prepare gradients and optionally clip
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
+    # Project grads to Stiefel tangent spaces before clipping (Riemannian update)
+    stiefel_project_grads_(raw_model)
+    if grad_clip != 0.0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
+    # Retract Stiefel/LoRA parameters back onto the manifold post-step
+    stiefel_reproject_all_(raw_model)
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 

@@ -29,11 +29,20 @@ def stiefel_reorth_(W: torch.Tensor, mode: str = "columns"):
             # Not feasible: fall back to row-orthonormal
             chosen = "rows"
         else:
-            Q, _ = torch.linalg.qr(W, mode='reduced')  # Q: (m, n)
-            W.copy_(Q)
-            return W
+            try:
+                Q, _ = torch.linalg.qr(W, mode='reduced')  # Q: (m, n)
+                W.copy_(Q)
+                return W
+            except Exception:
+                Q, _ = torch.linalg.qr(W.float().cpu(), mode='reduced')
+                W.copy_(Q.to(W.dtype).to(W.device))
+                return W
 
     # rows-orthonormal: operate on W^T, then transpose back
-    QT, _ = torch.linalg.qr(W.t(), mode='reduced')  # QT: (in, out)
-    W.copy_(QT.t())
+    try:
+        QT, _ = torch.linalg.qr(W.t(), mode='reduced')  # QT: (in, out)
+        W.copy_(QT.t())
+    except Exception:
+        QT, _ = torch.linalg.qr(W.t().float().cpu(), mode='reduced')
+        W.copy_(QT.t().to(W.dtype).to(W.device))
     return W

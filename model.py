@@ -199,6 +199,14 @@ class CausalSelfAttentionStiefel(nn.Module):
         self.Wk = mk_lin(getattr(config, 'stiefel_k', True), lora=False)
         self.Wv = mk_lin(False, lora=(getattr(config, 'lora_rank', 0) > 0))
         self.Wo = mk_lin(getattr(config, 'stiefel_o', False), lora=(getattr(config, 'lora_rank', 0) > 0))
+        # annotate roles for downstream training control (best-effort)
+        try:
+            setattr(self.Wq, 'stiefel_role', 'q')
+            setattr(self.Wk, 'stiefel_role', 'k')
+            setattr(self.Wv, 'stiefel_role', 'v')
+            setattr(self.Wo, 'stiefel_role', 'o')
+        except Exception:
+            pass
 
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
